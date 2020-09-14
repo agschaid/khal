@@ -43,7 +43,7 @@ from .exceptions import (CouldNotCreateDbDir, OutdatedDbVersionError,
 
 logger = logging.getLogger('khal')
 
-DB_VERSION = 5  # The current db layout version
+DB_VERSION = 6  # The current db layout version
 
 RECURRENCE_ID = 'RECURRENCE-ID'
 THISANDFUTURE = 'THISANDFUTURE'
@@ -74,6 +74,7 @@ class SQLiteDb(object):
                  calendars: Iterable[str],
                  db_path: Optional[str],
                  locale: Dict[str, str],
+                 calendar_filters: Dict[str, str],
                  ) -> None:
         assert db_path is not None
         self.calendars = list(calendars)
@@ -84,7 +85,7 @@ class SQLiteDb(object):
         self.conn = sqlite3.connect(self.db_path)
         self.cursor = self.conn.cursor()
         self._create_default_tables()
-        self._check_calendars_exists()
+        self._check_calendars_exists(calendar_filters)
         self._check_table_version()
 
     @contextlib.contextmanager
@@ -140,7 +141,8 @@ class SQLiteDb(object):
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS calendars (
             calendar TEXT NOT NULL UNIQUE,
             resource TEXT NOT NULL,
-            ctag TEXT
+            ctag TEXT,
+            filter_from_highlighting TEXT
             )''')
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS events (
                 href TEXT NOT NULL,
@@ -148,6 +150,7 @@ class SQLiteDb(object):
                 sequence INT,
                 etag TEXT,
                 item TEXT,
+                filter_from_highlighting INT NOT NULL,
                 primary key (href, calendar)
                 );''')
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS recs_loc (
@@ -172,7 +175,7 @@ class SQLiteDb(object):
             );''')
         self.conn.commit()
 
-    def _check_calendars_exists(self) -> None:
+    def _check_calendars_exists(self, calendar_filters: Dict[str, str]) -> None:
         """make sure an entry for the current calendar exists in `calendar`
         table
         """
@@ -183,8 +186,9 @@ class SQLiteDb(object):
             if result[0] != 0:
                 logger.debug("tables for calendar {0} exist".format(cal))
             else:
-                sql_s = 'INSERT INTO calendars (calendar, resource) VALUES (?, ?);'
-                stuple = (cal, '')
+                sql_s = ('INSERT INTO calendars (calendar, resource, filter_from_highlighting) '
+                         'VALUES (?, ?, ?);')
+                stuple = (cal, '', calendar_filters.get(cal))
                 self.sql_ex(sql_s, stuple)
 
     def sql_ex(self, statement: str, stuple: tuple) -> List:
@@ -195,7 +199,7 @@ class SQLiteDb(object):
             self.conn.commit()
         return result
 
-    def update(self, vevent_str: str, href: str, etag: str='', calendar: str=None) -> None:
+    def update(self, vevent_str: str, href: str, etag: str='', calendar: str=None, filter_from_highlighting: bool=False) -> None:
         """insert a new or update an existing event into the db
 
         This is mostly a wrapper around two SQL statements, doing some cleanup
@@ -239,12 +243,13 @@ class SQLiteDb(object):
             check_support(vevent, href, calendar)
             self._update_impl(vevent, href, calendar)
 
-        sql_s = ('INSERT INTO events (item, etag, href, calendar) VALUES (?, ?, ?, ?);')
-        stuple = (vevent_str, etag, href, calendar)
+        sql_s = ('INSERT INTO events (item, etag, href, calendar, filter_from_highlighting) VALUES (?, ?, ?, ?, ?);')
+
+        stuple = (vevent_str, etag, href, calendar, 1 if filter_from_highlighting else 0)
         self.sql_ex(sql_s, stuple)
 
     def update_vcf_dates(self, vevent_str: str, href: str, etag: str='',
-                         calendar: str=None) -> None:
+            calendar: str=None, filter_from_highlighting: bool = False) -> None:
         """insert events from a vcard into the db
 
         This is will parse BDAY, ANNIVERSARY, X-ANNIVERSARY and X-ABDATE fields.
@@ -316,9 +321,10 @@ class SQLiteDb(object):
                 vevent.add('uid', href + key)
                 vevent_str = vevent.to_ical().decode('utf-8')
                 self._update_impl(vevent, href + key, calendar)
-                sql_s = ('INSERT INTO events (item, etag, href, calendar)'
-                         ' VALUES (?, ?, ?, ?);')
-                stuple = (vevent_str, etag, href + key, calendar)
+                sql_s = ('INSERT INTO events (item, etag, href, calendar, filter_from_highlighting)'
+                         ' VALUES (?, ?, ?, ?, ?);')
+                stuple = (vevent_str, etag, href + key, calendar,
+                          1 if filter_from_highlighting else 0)
                 self.sql_ex(sql_s, stuple)
 
     def _update_impl(self, vevent: icalendar.cal.Event, href: str, calendar: str) -> None:
@@ -391,18 +397,31 @@ class SQLiteDb(object):
                 stuple_n = (dbstart, dbend, href, ref, dtype, rec_inst, calendar)
                 self.sql_ex(recs_sql_s, stuple_n)
 
+    def get_filter_from_highlighting(self, calendar: str) -> Optional[str]:
+        return self._get_calendar_string_property(calendar, 'filter_from_highlighting')
+
+    def set_filter_from_highlighting(self, filter_from_highlighting: str, calendar: str):
+        self._set_calendar_string_property(calendar, 'filter_from_highlighting',
+                                           filter_from_highlighting)
+
     def get_ctag(self, calendar=str) -> Optional[str]:
+        return self._get_calendar_string_property(calendar, 'ctag')
+
+    def set_ctag(self, ctag: str, calendar: str):
+        self._set_calendar_string_property(calendar, 'ctag', ctag)
+
+    def _get_calendar_string_property(self, calendar: str, prop: str) -> Optional[str]:
         stuple = (calendar, )
-        sql_s = 'SELECT ctag FROM calendars WHERE calendar = ?;'
+        sql_s = 'SELECT ' + prop + ' FROM calendars WHERE calendar =?;'
         try:
             ctag = self.sql_ex(sql_s, stuple)[0][0]
             return ctag
         except IndexError:
             return None
 
-    def set_ctag(self, ctag: str, calendar: str):
-        stuple = (ctag, calendar, )
-        sql_s = 'UPDATE calendars SET ctag = ? WHERE calendar = ?;'
+    def _set_calendar_string_property(self, calendar: str, prop: str, val: str):
+        stuple = (val, calendar, )
+        sql_s = 'UPDATE calendars SET ' + prop + ' = ? WHERE calendar = ?;'
         self.sql_ex(sql_s, stuple)
         self.conn.commit()
 
@@ -461,7 +480,8 @@ class SQLiteDb(object):
         sql_s = 'SELECT href, etag FROM events WHERE calendar = ?;'
         return list(set(self.sql_ex(sql_s, (calendar, ))))
 
-    def get_localized_calendars(self, start: dt.datetime, end: dt.datetime) -> Iterable[str]:
+    def get_localized_calendars(self, start: dt.datetime, end: dt.datetime,
+                                filter_from_highlighting: bool = False) -> Iterable[str]:
         assert start.tzinfo is not None
         assert end.tzinfo is not None
         start_u = utils.to_unix_time(start)
@@ -470,7 +490,10 @@ class SQLiteDb(object):
             'SELECT events.calendar FROM '
             'recs_loc JOIN events ON '
             'recs_loc.href = events.href AND '
-            'recs_loc.calendar = events.calendar WHERE '
+            'recs_loc.calendar = events.calendar WHERE ')
+        if filter_from_highlighting:
+            sql_s += 'events.filter_from_highlighting = 0 AND '
+        sql_s += (
             '(dtstart >= ? AND dtstart <= ? OR '
             'dtend > ? AND dtend <= ? OR '
             'dtstart <= ? AND dtend >= ?) AND events.calendar in ({0}) '
@@ -509,7 +532,8 @@ class SQLiteDb(object):
             end = pytz.UTC.localize(dt.datetime.utcfromtimestamp(end))
             yield item, href, start, end, ref, etag, calendar
 
-    def get_floating_calendars(self, start: dt.datetime, end: dt.datetime) -> Iterable[str]:
+    def get_floating_calendars(self, start: dt.datetime, end: dt.datetime,
+                               filter_from_highlighting: bool = False) -> Iterable[str]:
         assert start.tzinfo is None
         assert end.tzinfo is None
         start_u = utils.to_unix_time(start)
@@ -518,7 +542,10 @@ class SQLiteDb(object):
             'SELECT events.calendar FROM '
             'recs_float JOIN events ON '
             'recs_float.href = events.href AND '
-            'recs_float.calendar = events.calendar WHERE '
+            'recs_float.calendar = events.calendar WHERE ')
+        if filter_from_highlighting:
+            sql_s += 'events.filter_from_highlighting = 0 AND '
+        sql_s += (
             '(dtstart >= ? AND dtstart < ? OR '
             'dtend > ? AND dtend <= ? OR '
             'dtstart <= ? AND dtend > ? ) AND events.calendar in ({0}) '
